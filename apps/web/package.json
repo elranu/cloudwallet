@@ -44,7 +44,7 @@
     "ethers": "^6.7.1",
     "js-yaml": "^4.1.0",
     "lucide-react": "^0.290.0",
-    "next": "13.5.4",
+    "next": "14.2.7",
     "next-auth": "^4.24.5",
     "next-themes": "^0.2.1",
     "pino-pretty": "^11.1.0",
