@@ -1,28 +1,17 @@
 import { LOG_GROUP_NAME } from '@/shared/utils/constants';
 import { SSTConfig } from 'sst';
-import {
-  Cognito,
-  Config,
-  NextjsSite,
-  Script,
-  Table,
-  StackContext,
-  dependsOn,
-} from 'sst/constructs';
-import createLogGroup, { LogGroupSST } from './sst/cloudwatch-construct';
-import createKeys from './sst/key-builder';
+import { App, StackContext } from 'sst/constructs';
+import { Cognito, Config, NextjsSite, Script, Table } from 'sst/constructs';
 import { check } from '@/shared/utils/general';
-import { Duration, RemovalPolicy } from 'aws-cdk-lib';
 import { AccountRecovery, AdvancedSecurityMode, Mfa, OAuthScope } from 'aws-cdk-lib/aws-cognito';
 import { Effect, PolicyStatement } from 'aws-cdk-lib/aws-iam';
-import { KMS } from './sst/kms-construct';
-import crypto from 'crypto';
-import { getParameterPath } from 'sst/constructs/util/functionBinding.js';
 import { TableEncryption } from 'aws-cdk-lib/aws-dynamodb';
+import { KMSKey } from './pulumi/kms-construct';
+import { createCloudWatch, createLogGroupName } from './sst/cloudwatch-v3';
+import crypto from 'crypto';
 import { customRandom } from 'nanoid';
 import seedrandom from 'seedrandom';
 
-process.setMaxListeners(Infinity); //TODO remove this
 const localhostUrl = 'http://localhost:3000';
 
 const installationConfig = {
@@ -37,196 +26,193 @@ const installationConfig = {
 
 const name = `llavero${installationConfig.suffix}`;
 
-export default {
-  // eslint-disable-next-line no-unused-vars
-  config(_input) {
+function aliasName(stack: StackContext['stack'], index: number): string {
+  return `${stack.stackName}/key-${index}`;
+}
+
+const config: SSTConfig = {
+  config(_input: Record<string, string>) {
     return {
       name: name,
       region: installationConfig.region,
     };
   },
-  stacks(app) {
-    app.stack(llaveroStack);
-    app.stack(initLlavero);
+  stacks(app: App) {
+    return async ({ stack }: StackContext) => {
+      // Create KMS keys using Pulumi
+      const keys = Array.from({ length: installationConfig.numberOfKeys }).map(
+        (_, i) =>
+          new KMSKey(`key-${i}`, {
+            alias: aliasName(stack, i),
+            description: `Llavero KMS Key ${i}`,
+            keySpec: 'ECC_SECG_P256K1', // Required for blockchain signing
+          }),
+      );
+
+      // Create log group
+      const logGroup = createCloudWatch(stack, `${LOG_GROUP_NAME}ID`, {
+        name: createLogGroupName(stack, LOG_GROUP_NAME),
+      });
+
+      // Create user table
+      const userTable = new Table(stack, 'UserData', {
+        fields: {
+          pk: 'string',
+          sk: 'string',
+        },
+        primaryIndex: { partitionKey: 'pk', sortKey: 'sk' },
+        cdk: {
+          table: {
+            encryption: TableEncryption.AWS_MANAGED,
+          },
+        },
+      });
+
+      // Create Cognito auth
+      const auth = new Cognito(stack, 'LlaveroPool', {
+        login: ['email', 'username', 'preferredUsername', 'phone'],
+        cdk: {
+          userPool: {
+            selfSignUpEnabled: false,
+            signInAliases: { email: true },
+            accountRecovery: AccountRecovery.EMAIL_ONLY,
+            advancedSecurityMode: AdvancedSecurityMode.ENFORCED,
+            mfa: Mfa.OPTIONAL,
+            mfaSecondFactor: { otp: true, sms: true },
+            standardAttributes: {
+              email: { required: true, mutable: true },
+              phoneNumber: { required: true, mutable: true },
+            },
+            enableSmsRole: true,
+            snsRegion: installationConfig.region,
+            passwordPolicy: {
+              minLength: 8,
+              requireDigits: true,
+              requireLowercase: true,
+              requireSymbols: true,
+              requireUppercase: true,
+            },
+          },
+          userPoolClient: {
+            generateSecret: true,
+            authFlows: {
+              userPassword: true,
+              userSrp: true,
+            },
+            oAuth: {
+              callbackUrls: [`${localhostUrl}/api/auth/callback/cognito`],
+              logoutUrls: [`${localhostUrl}/api/auth/signout`],
+              scopes: [
+                OAuthScope.EMAIL,
+                OAuthScope.OPENID,
+                OAuthScope.custom('aws.cognito.signin.user.admin'),
+                OAuthScope.PROFILE,
+              ],
+              flows: {
+                authorizationCodeGrant: true,
+                implicitCodeGrant: true,
+              },
+            },
+          },
+        },
+      });
+
+      auth.cdk.userPool.addDomain('LlaveroDomain', {
+        cognitoDomain: {
+          domainPrefix: name + app.stage,
+        },
+      });
+
+      // Create site URL parameter
+      const SITE_URL = new Config.Parameter(stack, 'LLAVERO_URL', {
+        value: 'emptyyyy',
+      });
+
+      // Create Next.js site
+      const site = new NextjsSite(stack, 'Llavero', {
+        bind: [logGroup, userTable, auth, SITE_URL, ...keys],
+        environment: {
+          LOG_GROUP_NAME: logGroup.value,
+          USER_TABLE_NAME: userTable.tableName,
+          USER_POOL_ID: auth.userPoolId,
+          USER_POOL_CLIENT_ID: auth.userPoolClientId,
+          COGNITO_POOL_ID: auth.cognitoIdentityPoolId ?? 'empty',
+          POOL_SECRET: auth.cdk.userPoolClient.userPoolClientSecret.toString() ?? 'empty',
+          NEXTAUTH_SECRET: randomString(16),
+          SITEURL_PARAM_NAME: SITE_URL.name,
+          REGION: installationConfig.region,
+          NEXT_PUBLIC_REGION: installationConfig.region,
+          NEXT_PUBLIC_USER_POOL_CLIENT_ID: auth.userPoolClientId,
+          NEXT_PUBLIC_USER_POOL_ID: auth.userPoolId,
+          NEXT_PUBLIC_COGNITO_POOL_ID: auth.cognitoIdentityPoolId ?? 'empty',
+        },
+      });
+
+      site.attachPermissions([
+        new PolicyStatement({
+          actions: ['ssm:GetParameter'],
+          effect: Effect.ALLOW,
+          resources: [SITE_URL.arn],
+        }),
+        new PolicyStatement({
+          actions: ['cognito-idp:UpdateUserPoolClient'],
+          effect: Effect.ALLOW,
+          resources: [auth.userPoolArn],
+        }),
+        new PolicyStatement({
+          actions: [
+            'sns:CreateSMSSandboxPhoneNumber',
+            'sns:VerifySMSSandboxPhoneNumber',
+            'sns:ListSMSSandboxPhoneNumbers',
+            'sns:DeleteSMSSandboxPhoneNumber',
+          ],
+          effect: Effect.ALLOW,
+          resources: ['*'],
+        }),
+      ]);
+
+      // Initialize user table with Pulumi KMS keys
+      const script = new Script(stack, 'AfterDeploy', {
+        onCreate: `${process.cwd()}/src/repositories/user-table-init.main`,
+        onUpdate: `${process.cwd()}/src/repositories/user-table-init.main`,
+        params: {
+          tableName: userTable.tableName,
+          keys: keys.map((k) => ({ keyId: k.keyId, keyArn: k.keyArn })),
+          cognitoPoolId: auth.userPoolId,
+          UserPoolClientId: auth.userPoolClientId,
+          config: installationConfig,
+          arnSiteParameter: SITE_URL.name,
+          siteUrl: site.url ?? localhostUrl,
+        },
+      });
+
+      script.bind([userTable, logGroup, auth, SITE_URL, ...keys]);
+      script.attachPermissions([
+        new PolicyStatement({
+          actions: ['dynamodb:*'],
+          effect: Effect.ALLOW,
+          resources: [userTable.tableArn],
+        }),
+        new PolicyStatement({
+          actions: ['cognito-idp:*'],
+          effect: Effect.ALLOW,
+          resources: [auth.userPoolArn],
+        }),
+        new PolicyStatement({
+          actions: ['ssm:PutParameter'],
+          effect: Effect.ALLOW,
+          resources: [SITE_URL.arn],
+        }),
+      ]);
+
+      stack.addOutputs({
+        finished: 'true',
+      });
+    };
   },
 } satisfies SSTConfig;
 
-let userTable: Table;
-let logGroup: LogGroupSST;
-let keys: Array<KMS>;
-let auth: Cognito;
-let site: NextjsSite;
-let SITE_URL: Config.Parameter;
-
-export function llaveroStack({ stack, app }: StackContext) {
-  keys = createKeys(stack, installationConfig.numberOfKeys);
-  logGroup = createLogGroup(stack, `${LOG_GROUP_NAME}ID`, { name: LOG_GROUP_NAME });
-
-  userTable = new Table(stack, 'UserData', {
-    cdk: {
-      table: {
-        removalPolicy: RemovalPolicy.DESTROY, //TODO think this could be SNAPSHOT
-        encryption: TableEncryption.AWS_MANAGED,
-      },
-    },
-    fields: {
-      pk: 'string',
-      sk: 'string',
-    },
-    primaryIndex: { partitionKey: 'pk', sortKey: 'sk' },
-  });
-
-  auth = new Cognito(stack, 'LlaveroPool', {
-    login: ['email', 'username', 'preferredUsername', 'phone'],
-    cdk: {
-      userPool: {
-        selfSignUpEnabled: false,
-        signInAliases: { email: true },
-        accountRecovery: AccountRecovery.EMAIL_ONLY,
-        advancedSecurityMode: AdvancedSecurityMode.ENFORCED,
-        removalPolicy: RemovalPolicy.DESTROY,
-        mfa: Mfa.OPTIONAL,
-        mfaSecondFactor: { otp: true, sms: true },
-        standardAttributes: {
-          email: { required: true, mutable: true },
-          phoneNumber: { required: true, mutable: true },
-        },
-        enableSmsRole: true,
-        snsRegion: installationConfig.region,
-        passwordPolicy: {
-          minLength: 8,
-          requireDigits: true,
-          requireLowercase: true,
-          requireSymbols: true,
-          requireUppercase: true,
-          tempPasswordValidity: Duration.days(3),
-        },
-      },
-      userPoolClient: {
-        generateSecret: true,
-        authFlows: {
-          userPassword: true,
-          userSrp: true,
-        },
-        oAuth: {
-          callbackUrls: [`${localhostUrl}/api/auth/callback/cognito`],
-          logoutUrls: [`${localhostUrl}/api/auth/signout`],
-          scopes: [
-            OAuthScope.EMAIL,
-            OAuthScope.OPENID,
-            OAuthScope.custom('aws.cognito.signin.user.admin'),
-            OAuthScope.PROFILE,
-          ], //["openid", "profile", "email", "phone", "aws.cognito.signin.user.admin"],
-          flows: {
-            authorizationCodeGrant: true,
-            implicitCodeGrant: true,
-          },
-        },
-      },
-    },
-  });
-
-  auth.cdk.userPool.addDomain('LlaveroDomain', {
-    cognitoDomain: {
-      domainPrefix: name + app.stage, //TODO config input, should be saved or query
-    },
-  });
-
-  SITE_URL = new Config.Parameter(stack, 'LLAVERO_URL', {
-    value: 'emptyyyy',
-  });
-
-  site = new NextjsSite(stack, 'Llavero', {
-    bind: [logGroup, userTable, auth, SITE_URL, ...keys],
-    environment: {
-      LOG_GROUP_NAME: logGroup.name,
-      USER_TABLE_NAME: userTable.tableName,
-      USER_POOL_ID: auth.userPoolId,
-      USER_POOL_CLIENT_ID: auth.userPoolClientId,
-      COGNITO_POOL_ID: auth.cognitoIdentityPoolId ?? 'empty',
-      POOL_SECRET: auth.cdk.userPoolClient.userPoolClientSecret.toString() ?? 'empty',
-      NEXTAUTH_SECRET: randomString(16), //TODO config input, should be saved or query
-      SITEURL_PARAM_NAME: getParameterPath(SITE_URL, 'value'), //TODO horrible workaround. I should be able to set the variable on the env directly
-      REGION: installationConfig.region,
-      NEXT_PUBLIC_REGION: installationConfig.region,
-      NEXT_PUBLIC_USER_POOL_CLIENT_ID: auth.userPoolClientId,
-      NEXT_PUBLIC_USER_POOL_ID: auth.userPoolId,
-      NEXT_PUBLIC_COGNITO_POOL_ID: auth.cognitoIdentityPoolId ?? 'empty',
-    },
-  });
-
-  //TODO horrible workaround. this is because I can't set environment variables of NextjsSite directly and because I cant get the site url before
-  const arnParameter = `arn:aws:ssm:${app.region}:${app.account}:parameter${getParameterPath(
-    SITE_URL,
-    'value',
-  )}`;
-  site.attachPermissions([
-    new PolicyStatement({
-      actions: ['ssm:GetParameter'],
-      effect: Effect.ALLOW,
-      resources: [arnParameter],
-    }),
-    new PolicyStatement({
-      actions: ['cognito-idp:UpdateUserPoolClient'],
-      effect: Effect.ALLOW,
-      resources: [auth.userPoolArn],
-    }),
-    new PolicyStatement({
-      actions: [
-        'sns:CreateSMSSandboxPhoneNumber',
-        'sns:VerifySMSSandboxPhoneNumber',
-        'sns:ListSMSSandboxPhoneNumbers',
-        'sns:DeleteSMSSandboxPhoneNumber',
-      ],
-      effect: Effect.ALLOW,
-      resources: ['*'],
-    }),
-  ]);
-
-  stack.addOutputs({
-    finished: 'true',
-  });
-}
-
-export function initLlavero({ stack, app }: StackContext) {
-  const arnParameter = `arn:aws:ssm:${app.region}:${app.account}:parameter${getParameterPath(
-    SITE_URL,
-    'value',
-  )}`;
-  const basePath = `${process.cwd()}/`;
-  dependsOn(llaveroStack);
-  const script = new Script(stack, 'AfterDeploy', {
-    onCreate: `${basePath}src/repositories/user-table-init.main`,
-    onUpdate: `${basePath}src/repositories/user-table-init.main`,
-    params: {
-      tableName: userTable.tableName,
-      keys: keys.map((k) => ({ keyArn: k.keyArn })),
-      cognitoPoolId: auth.userPoolId,
-      UserPoolClientId: auth.userPoolClientId,
-      config: installationConfig,
-      arnSiteParameter: getParameterPath(SITE_URL, 'value'),
-      siteUrl: site.url ?? localhostUrl,
-    },
-  });
-  script.bind([userTable, logGroup, auth, SITE_URL, ...keys]);
-  script.attachPermissions([
-    new PolicyStatement({
-      actions: ['dynamodb:*'],
-      effect: Effect.ALLOW,
-      resources: [userTable.tableArn],
-    }),
-    new PolicyStatement({
-      actions: ['cognito-idp:*'],
-      effect: Effect.ALLOW,
-      resources: [auth.userPoolArn],
-    }),
-    new PolicyStatement({
-      actions: ['ssm:PutParameter'],
-      effect: Effect.ALLOW,
-      resources: [arnParameter],
-    }),
-  ]);
-}
+export default config;
 
 function randomString(length: number, justChars = false): string {
   let chars = 'abcdefghijklmnopqrstuvwxyz0123456789';

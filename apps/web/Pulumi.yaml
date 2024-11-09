@@ -1,0 +1,3 @@
+name: llavero-kms
+runtime: nodejs
+description: Llavero KMS infrastructure using Pulumi

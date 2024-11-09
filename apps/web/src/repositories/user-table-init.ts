@@ -8,14 +8,16 @@ import {
 } from '@aws-sdk/client-cognito-identity-provider';
 import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { AwsKmsSigner } from '@dennisdang/ethers-aws-kms-signer';
-import { getKeyId } from '@/shared/utils/crypto';
-import * as kmsClient from '@aws-sdk/client-kms';
+import { KMSClient } from '@dennisdang/ethers-aws-kms-signer/node_modules/@aws-sdk/client-kms';
 import { JsonRpcProvider } from 'ethers';
 import { EIP155_MAINNET_CHAINS } from '@/data/EIP155Data';
 
 export interface ICloudWalletInitParams {
   tableName: string;
-  keys: [{ keyArn: string }];
+  keys: Array<{
+    keyId: pulumi.Output<string>;
+    keyArn: pulumi.Output<string>;
+  }>;
   cognitoPoolId: string;
   UserPoolClientId: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -70,9 +72,9 @@ export async function main(event: { params: ICloudWalletInitParams }) {
   if (!user) throw new Error('User not found');
 
   const keys = new Array<KmsKey>();
-  const keysArn = event.params.keys.map((k) => k.keyArn);
-  console.log('keysArn: ', keysArn);
-  const keyClient = new kmsClient.KMSClient();
+  const keysInfo = event.params.keys;
+  console.log('keysInfo: ', keysInfo);
+  const keyClient = new KMSClient({ region: event.params.config.region });
   const provider = new JsonRpcProvider(
     EIP155_MAINNET_CHAINS['eip155:1'].rpc || 'https://eth.llamarpc.com',
   ); //TODO get from an endpoint
@@ -83,12 +85,18 @@ export async function main(event: { params: ICloudWalletInitParams }) {
     console.log(err);
     provider.destroy();
   }
-  for (let index = 0; index < keysArn.length; index++) {
-    const element = keysArn[index];
-    const signer = new AwsKmsSigner(getKeyId(element), keyClient, provider);
+  for (const keyInfo of keysInfo) {
+    const keyId = await keyInfo.keyId;
+    const keyArn = await keyInfo.keyArn;
+    const signer = new AwsKmsSigner(keyId, keyClient, provider);
     const addr = await signer.getAddress();
-    console.log('addr for keyArn: ', addr, element);
-    keys.push({ keyArn: element, address: addr, name: `key${index}`, username: user?.username });
+    console.log('addr for keyArn: ', addr, keyArn);
+    keys.push({
+      keyArn,
+      address: addr,
+      name: `key-${keyId.split('/').pop()}`,
+      username: user?.username,
+    });
   }
   if (keys.length <= 0) throw new Error('No keys found');
 
