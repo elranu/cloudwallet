@@ -28,8 +28,20 @@ export async function PATCH(request: NextRequest, { params }: { params: { addres
       return NextResponse.json({ message: 'Not authorized' }, { status: 401 });
 
     const { address } = params || {};
-    const body: { name: string } = await request.json();
-    const { name } = body || {};
+    const rawBody = await request.json();
+
+    // Type guard to ensure body has the correct shape
+    if (
+      !rawBody ||
+      typeof rawBody !== 'object' ||
+      !('name' in rawBody) ||
+      typeof rawBody.name !== 'string'
+    ) {
+      return NextResponse.json({ message: 'Invalid request body' }, { status: 400 });
+    }
+
+    const body = rawBody as { name: string };
+    const { name } = body;
 
     return NextResponse.json(
       await updateWalletName(address || '', session?.user?.email, {
