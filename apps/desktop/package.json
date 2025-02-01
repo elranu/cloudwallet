@@ -79,7 +79,7 @@
     "@mui/styled-engine-sc": "^6.0.0-alpha.2",
     "@timfish/webpack-asset-relocator-loader": "^0.1.0",
     "aws-cdk": "2.79.1",
-    "aws-cdk-lib": "2.79.1",
+    "aws-cdk-lib": "2.177.0",
     "aws-sdk": "2.1343.0",
     "cdk-assets": "2.95.1",
     "clsx": "^2.0.0",
