@@ -1,4 +1,4 @@
-FROM node:18.18.2-bullseye-slim
+FROM node:18.20.6-bullseye-slim
 RUN apt-get update && apt-get install -y --no-install-recommends dumb-init \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
